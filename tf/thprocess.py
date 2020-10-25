@@ -27,6 +27,8 @@ import multiprocessing as mp
 import tensorflow as tf
 from tfprocess import TFProcess
 from chunkparser import ChunkParser
+import numpy as np
+import torch as th
 
 SKIP = 32
 SKIP_MULTIPLE = 1024
@@ -349,6 +351,25 @@ def select_extractor(mode):
 def semi_sample(x):
     return tf.slice(tf.random.shuffle(x), [0], [SKIP_MULTIPLE])
 
+class ResidualBlock(th.nn.Module):
+    def __init__(self, filter=128, kernel_size=3, padding=1, bias=False):
+        super().__init__()
+        self.conv1 = th.nn.Conv2d(filter, filter, kernel_size, padding=padding, bias=bias)
+        self.bn1 = th.nn.BatchNorm2d(filter)
+        self.relu = th.nn.ReLU()
+        self.conv2 = th.nn.Conv2d(filter, filter, kernel_size, padding=padding, bias=bias)
+        self.bn2 = th.nn.BatchNorm2d(filter)
+    
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += x
+        out = self.relu(out)
+        return out
+
 
 def main(cmd):
     cfg = yaml.safe_load(cmd.cfg.read())
@@ -378,113 +399,79 @@ def main(cmd):
     shuffle_size = cfg['training']['shuffle_size']
     total_batch_size = cfg['training']['batch_size']
     batch_splits = cfg['training'].get('num_batch_splits', 1)
-    train_workers = cfg['dataset'].get('train_workers', None)
-    test_workers = cfg['dataset'].get('test_workers', None)
     if total_batch_size % batch_splits != 0:
         raise ValueError('num_batch_splits must divide batch_size evenly')
     split_batch_size = total_batch_size // batch_splits
     # Load data with split batch size, which will be combined to the total batch size in tfprocess.
     ChunkParser.BATCH_SIZE = split_batch_size
 
-    root_dir = os.path.join(cfg['training']['path'], cfg['name'])
-    if not os.path.exists(root_dir):
-        os.makedirs(root_dir)
     tfprocess = TFProcess(cfg)
-    experimental_reads = max(2, mp.cpu_count() - 2) // 2
-    extractor = select_extractor(tfprocess.INPUT_MODE)
 
-    def read(x):
-        return tf.data.FixedLengthRecordDataset(
-            x,
-            8308,
-            compression_type='GZIP',
-            num_parallel_reads=experimental_reads)
+    train_parser = ChunkParser(train_chunks,
+                              tfprocess.INPUT_MODE,
+                              shuffle_size=10000,
+                              sample=SKIP,
+                              batch_size=ChunkParser.BATCH_SIZE,
+                              workers=4)
+    batch_gen = train_parser.parse()
+    device = th.device('cuda:0' if th.cuda.is_available() else 'cpu')
 
-    if experimental_parser:
-        train_dataset = tf.data.Dataset.from_tensor_slices(train_chunks).shuffle(len(train_chunks)).repeat().batch(256)\
-                         .interleave(read, num_parallel_calls=2)\
-                         .batch(SKIP_MULTIPLE*SKIP).map(semi_sample).unbatch()\
-                         .shuffle(shuffle_size)\
-                         .batch(split_batch_size).map(extractor).prefetch(4)
-    else:
-        train_parser = ChunkParser(train_chunks,
-                                   tfprocess.INPUT_MODE,
-                                   shuffle_size=shuffle_size,
-                                   sample=SKIP,
-                                   batch_size=ChunkParser.BATCH_SIZE,
-                                   workers=train_workers)
-        train_dataset = tf.data.Dataset.from_generator(
-            train_parser.parse,
-            output_types=(tf.string, tf.string, tf.string, tf.string,
-                          tf.string))
-        train_dataset = train_dataset.map(ChunkParser.parse_function)
-        train_dataset = train_dataset.prefetch(4)
-
-    shuffle_size = int(shuffle_size * (1.0 - train_ratio))
-    if experimental_parser:
-        test_dataset = tf.data.Dataset.from_tensor_slices(test_chunks).shuffle(len(test_chunks)).repeat().batch(256)\
-                         .interleave(read, num_parallel_calls=2)\
-                         .batch(SKIP_MULTIPLE*SKIP).map(semi_sample).unbatch()\
-                         .shuffle(shuffle_size)\
-                         .batch(split_batch_size).map(extractor).prefetch(4)
-    else:
-        test_parser = ChunkParser(test_chunks,
-                                  tfprocess.INPUT_MODE,
-                                  shuffle_size=shuffle_size,
-                                  sample=SKIP,
-                                  batch_size=ChunkParser.BATCH_SIZE,
-                                  workers=test_workers)
-        test_dataset = tf.data.Dataset.from_generator(
-            test_parser.parse,
-            output_types=(tf.string, tf.string, tf.string, tf.string,
-                          tf.string))
-        test_dataset = test_dataset.map(ChunkParser.parse_function)
-        test_dataset = test_dataset.prefetch(4)
-
-    validation_dataset = None
-    if 'input_validation' in cfg['dataset']:
-        valid_chunks = get_all_chunks(cfg['dataset']['input_validation'])
-        validation_dataset = tf.data.FixedLengthRecordDataset(valid_chunks, 8308, compression_type='GZIP', num_parallel_reads=experimental_reads)\
-                               .batch(split_batch_size, drop_remainder=True).map(extractor).prefetch(4)
-
-    tfprocess.init_v2(train_dataset, test_dataset, validation_dataset)
-
-    tfprocess.restore_v2()
-
-    # If number of test positions is not given
-    # sweeps through all test chunks statistically
-    # Assumes average of 10 samples per test game.
-    # For simplicity, testing can use the split batch size instead of total batch size.
-    # This does not affect results, because test results are simple averages that are independent of batch size.
-    num_evals = cfg['training'].get('num_test_positions',
-                                    len(test_chunks) * 10)
-    num_evals = max(1, num_evals // ChunkParser.BATCH_SIZE)
-    print("Using {} evaluation batches".format(num_evals))
-
-    tfprocess.process_loop_v2(total_batch_size,
-                              num_evals,
-                              batch_splits=batch_splits)
-
-    if cmd.output is not None:
-        if cfg['training'].get('swa_output', False):
-            tfprocess.save_swa_weights_v2(cmd.output)
-        else:
-            tfprocess.save_leelaz_weights_v2(cmd.output)
+    model = th.nn.Sequential(
+        th.nn.Conv2d(112, 128, 3, padding=1, bias=False), 
+        th.nn.ReLU(), 
+        ResidualBlock(), 
+        ResidualBlock(), 
+        ResidualBlock(), 
+        ResidualBlock(), 
+        ResidualBlock(), 
+        ResidualBlock(), 
+        th.nn.Conv2d(128, 32, 1, bias=False), 
+        th.nn.ReLU(), 
+        th.nn.Flatten(), 
+        th.nn.Linear(2048, 1858, bias=False)
+    )
+    model.train()
+    model = model.to(device)
+    optimizer = th.optim.SGD(model.parameters(), lr=0.01)
+    train_batches = 100000
+    for i in range(train_batches):
+        # print(f'getting data {i} ...')
+        x, y, z, q, m = next(batch_gen)
+        x, y, z, q, m = ChunkParser.parse_function(x, y, z, q, m)
+        x = x.numpy()
+        x = th.Tensor(x)  
+        x = x.reshape((-1, 112, 8, 8))
+        y = th.Tensor(y.numpy())
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        policy = model(x)
+        loss = th.mean(th.sum(-th.log_softmax(policy, 1) * th.nn.functional.relu(y), 1))
+        loss.backward()
+        optimizer.step()
+        if i % 10 == 0:
+            print(f'step = {i}, loss = {loss.item()}')
 
     train_parser.shutdown()
-    test_parser.shutdown()
 
 
 if __name__ == "__main__":
-    argparser = argparse.ArgumentParser(description=\
-    'Tensorflow pipeline for training Leela Chess.')
-    argparser.add_argument('--cfg',
-                           type=argparse.FileType('r'),
-                           help='yaml configuration with training parameters')
-    argparser.add_argument('--output',
-                           type=str,
-                           help='file to store weights in')
+    # target0 = np.random.random((2048, 1858))
+    # output0 = np.random.random((2048, 1858))
+    # target = tf.convert_to_tensor(target0)
+    # output = tf.convert_to_tensor(output0)
+    # loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(target, output))
+    # target2 = th.from_numpy(target0)
+    # output2 = th.from_numpy(output0)
+    # loss2 = th.mean(th.sum(-th.log_softmax(output2, 1) * target2, 1))
+    # print(loss)
+    # print(loss2)
 
-    #mp.set_start_method('spawn')
-    main(argparser.parse_args())
-    mp.freeze_support()
+
+    conf = '/root/lczero-training/tf/configs/example.yaml'
+    class A():
+        pass
+    cmd = A()
+    cmd.cfg = open(conf)
+    cmd.output = '/tmp/test_tmp.txt'
+    main(cmd)
+    cmd.cfg.close()

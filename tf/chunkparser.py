@@ -225,7 +225,7 @@ class ChunkParser:
         if plies_left == 0:
             plies_left = dep_ply_count
         plies_left = struct.pack('f', plies_left)
-
+        
         assert input_format == self.expected_input_format
 
         # Unpack bit planes and cast to 32 bit float
@@ -285,7 +285,7 @@ class ChunkParser:
 
         best_q_w = 0.5 * (1.0 - best_d + best_q)
         best_q_l = 0.5 * (1.0 - best_d - best_q)
-        assert -1.0 <= best_q <= 1.0 and 0.0 <= best_d <= 1.0
+        # assert -1.0 <= best_q <= 1.0 and 0.0 <= best_d <= 1.0
         best_q = struct.pack('fff', best_q_w, best_d, best_q_l)
 
         return (planes, probs, winner, best_q, plies_left)
@@ -474,6 +474,7 @@ class ChunkParserTest(unittest.TestCase):
             records.append(record)
 
         parser = ChunkParser(ChunkDataSrc(records),
+                             4, 
                              shuffle_size=1,
                              workers=1,
                              batch_size=batch_size)
@@ -520,6 +521,7 @@ class ChunkParserTest(unittest.TestCase):
             records.append(record)
 
         parser = ChunkParser(ChunkDataSrc(records),
+                             4, 
                              shuffle_size=1,
                              workers=1,
                              batch_size=batch_size)
@@ -554,5 +556,18 @@ class ChunkParserTest(unittest.TestCase):
         parser.shutdown()
 
 
+def test_chunkparser():
+    chunks = ['/root/training-run2-test73_0-20201011-0017/training.226207651.gz']
+    parser = ChunkParser(chunks,
+                         1, 
+                         shuffle_size=1,
+                         workers=1,
+                         batch_size=1)
+    batchgen = parser.parse()
+    data = next(batchgen)
+    for i, d in enumerate(data):
+        print(f'{i}: {len(d)}')
+
 if __name__ == '__main__':
-    unittest.main()
+    # unittest.main()
+    test_chunkparser()
